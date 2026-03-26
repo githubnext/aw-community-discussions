@@ -46,7 +46,7 @@ jobs:
               event_type: "staff-label-correction",
               client_payload: {
                 source_repository: `${context.repo.owner}/${context.repo.repo}`,
-                target_repository: `${context.repo.owner}/${context.repo.repo}`,
+                target_repository: ${{ env.COMMUNITY_OPS_REPOSITORY }},
                 discussion_number: discussion.number,
                 discussion_title: discussion.title || "unknown",
                 discussion_url: discussion.html_url || discussion.url || "",
