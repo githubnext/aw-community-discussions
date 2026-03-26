@@ -13,7 +13,7 @@ jobs:
   dispatch-feedback-event:
     runs-on: ubuntu-latest
     env:
-      COMMUNITY_OPS_REPOSITORY: community/community-ops
+      COMMUNITY_OPS_REPOSITORY: githubnext/aw-community-ops
     steps:
       - name: Forward discussion label events
         uses: actions/github-script@v8
