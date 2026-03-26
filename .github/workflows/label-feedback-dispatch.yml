@@ -52,7 +52,6 @@ jobs:
                 discussion_url: discussion.html_url || discussion.url || "",
                 category: discussion.category?.name || "unknown",
                 category_slug: discussion.category?.slug || "unknown",
-                event_type: action,
                 label: label.name,
                 actor,
                 createdAt: new Date().toISOString(),
