@@ -16,6 +16,9 @@ safe-outputs:
   footer: false
   create-discussion:
     max: 10
+  update-discussion:
+    labels:
+    max: 10
 ---
 
 # Community Discussion Mirror
@@ -31,7 +34,9 @@ For each discussion you mirror:
 1. Copy the substance of the title and opening post.
 2. Remove source backlinks and any direct references to the source repository or discussion.
 3. Preserve the intent, structure, and useful details.
-4. Create the mirrored discussion in this repository using the `create-discussion` safe output.
+4. Copy any labels from the source discussion that also exist in this repository.
+5. Create the mirrored discussion in this repository using the `create-discussion` safe output.
+6. After creation, use `update-discussion` to apply matching labels to the newly created discussion.
 
 ## Scope
 
@@ -70,6 +75,12 @@ When composing mirrored content:
 - Escape or omit any GitHub references that would create timeline backlinks.
 - Preserve markdown formatting when it helps readability.
 
+## Label Handling
+
+For each source discussion, inspect its labels. If a label with the same name exists in this repository, include it when mirroring. Since `create-discussion` does not support labels directly, use `update-discussion` after creating the discussion to apply the matching labels.
+
+Do not create new labels. Only apply labels that already exist in the destination repository.
+
 ## Category Handling
 
 If you can determine a discussion category in this repository that matches the source category closely, use it.
@@ -83,6 +94,7 @@ For each created discussion, produce one `create-discussion` safe output item wi
 - A standalone title that makes sense without the source repository.
 - A cleaned body with no backlinks or source references.
 - A category only when you are confident it exists in this repository.
+- Labels that exist in both the source discussion and this repository.
 
 Do not create more than 10 discussions in one run.
 
