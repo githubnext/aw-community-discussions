@@ -1,0 +1,144 @@
+name: Delete All Discussions
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type "DELETE" to confirm deletion of all discussions'
+        required: true
+        type: string
+      category:
+        description: 'Optional: only delete discussions in this category (leave empty for all)'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  discussions: write
+
+jobs:
+  delete-discussions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete all discussions
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const category = '${{ github.event.inputs.category }}'.trim();
+            const dryRun = '${{ github.event.inputs.confirm }}' !== 'DELETE';
+
+            if (dryRun) {
+              core.info('DRY RUN: Will count discussions without deleting. Type "DELETE" to confirm actual deletion.');
+            }
+
+            // Get repository ID
+            const repoQuery = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  id
+                }
+              }
+            `, { owner, repo });
+            const repoId = repoQuery.repository.id;
+
+            let totalCount = 0;
+            let totalDeleted = 0;
+            let hasNextPage = true;
+            let cursor = null;
+
+            while (hasNextPage) {
+              // Fetch a batch of discussions
+              let query;
+              let variables = { owner, repo, first: 100 };
+              if (dryRun && cursor) variables.after = cursor;
+
+              if (category) {
+                // Get category ID first
+                const catQuery = await github.graphql(`
+                  query($owner: String!, $repo: String!) {
+                    repository(owner: $owner, name: $repo) {
+                      discussionCategories(first: 100) {
+                        nodes { id name }
+                      }
+                    }
+                  }
+                `, { owner, repo });
+
+                const cat = catQuery.repository.discussionCategories.nodes.find(
+                  c => c.name.toLowerCase() === category.toLowerCase()
+                );
+                if (!cat) {
+                  core.setFailed(`Category "${category}" not found`);
+                  return;
+                }
+
+                query = `
+                  query($owner: String!, $repo: String!, $first: Int!, $after: String, $categoryId: ID!) {
+                    repository(owner: $owner, name: $repo) {
+                      discussions(first: $first, after: $after, categoryId: $categoryId) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { id number title }
+                      }
+                    }
+                  }
+                `;
+                variables.categoryId = cat.id;
+              } else {
+                query = `
+                  query($owner: String!, $repo: String!, $first: Int!, $after: String) {
+                    repository(owner: $owner, name: $repo) {
+                      discussions(first: $first, after: $after) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { id number title }
+                      }
+                    }
+                  }
+                `;
+              }
+
+              const result = await github.graphql(query, variables);
+              const discussions = result.repository.discussions.nodes;
+
+              if (discussions.length === 0) {
+                break;
+              }
+
+              totalCount += discussions.length;
+
+              if (dryRun) {
+                for (const discussion of discussions) {
+                  core.info(`[DRY RUN] Would delete discussion #${discussion.number}: ${discussion.title}`);
+                }
+                // In dry-run, use pageInfo to continue pagination
+                hasNextPage = result.repository.discussions.pageInfo.hasNextPage;
+                cursor = result.repository.discussions.pageInfo.endCursor;
+              } else {
+                // Delete each discussion
+                for (const discussion of discussions) {
+                  try {
+                    await github.graphql(`
+                      mutation($id: ID!) {
+                        deleteDiscussion(input: { id: $id }) {
+                          discussion { id }
+                        }
+                      }
+                    `, { id: discussion.id });
+                    totalDeleted++;
+                    core.info(`Deleted discussion #${discussion.number}: ${discussion.title}`);
+                  } catch (err) {
+                    core.warning(`Failed to delete discussion #${discussion.number}: ${err.message}`);
+                  }
+                }
+                // Re-check if there are more (since we're deleting, don't use cursor)
+                hasNextPage = discussions.length > 0;
+              }
+            }
+
+            if (dryRun) {
+              core.info(`DRY RUN complete: ${totalCount} discussion(s) would be deleted.`);
+            } else {
+              core.info(`Total discussions deleted: ${totalDeleted}`);
+            }
