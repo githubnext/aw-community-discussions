@@ -1,0 +1,195 @@
+name: Community Discussion Mirror
+
+on:
+  schedule:
+    - cron: "0 9 * * 1-5" # weekdays at 09:00 UTC
+  workflow_dispatch:
+    inputs:
+      max_discussions:
+        description: "Maximum number of discussions to mirror per run"
+        required: false
+        default: "10"
+        type: string
+
+permissions:
+  contents: read
+  discussions: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mirror discussions
+        uses: actions/github-script@v7
+        env:
+          SOURCE_OWNER: community
+          SOURCE_REPO: community
+          MAX_DISCUSSIONS: ${{ github.event.inputs.max_discussions || '10' }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const SOURCE_OWNER = process.env.SOURCE_OWNER;
+            const SOURCE_REPO = process.env.SOURCE_REPO;
+            const SOURCE_SLUG = `${SOURCE_OWNER}/${SOURCE_REPO}`;
+            const MAX_DISCUSSIONS = parseInt(process.env.MAX_DISCUSSIONS, 10);
+
+            const escSlug = SOURCE_SLUG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+            // --- Fetch existing discussion titles in this repo for dedup ---
+            const existingQuery = await github.graphql(`
+              query($owner: String!, $name: String!) {
+                repository(owner: $owner, name: $name) {
+                  discussions(first: 100, orderBy: {field: CREATED_AT, direction: DESC}) {
+                    nodes { title }
+                  }
+                }
+              }
+            `, { owner: context.repo.owner, name: context.repo.repo });
+            const existingTitles = new Set(existingQuery.repository.discussions.nodes.map(d => d.title));
+
+            // --- Fetch destination categories ---
+            const destCatsQuery = await github.graphql(`
+              query($owner: String!, $name: String!) {
+                repository(owner: $owner, name: $name) {
+                  discussionCategories(first: 25) {
+                    nodes { id name }
+                  }
+                }
+              }
+            `, { owner: context.repo.owner, name: context.repo.repo });
+            const destCategories = destCatsQuery.repository.discussionCategories.nodes;
+            const destCatByName = Object.fromEntries(destCategories.map(c => [c.name, c.id]));
+
+            // --- Fetch destination labels ---
+            const destLabelsResp = await github.rest.issues.listLabelsForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100
+            });
+            const destLabelNames = new Set(destLabelsResp.data.map(l => l.name));
+
+            // --- Fetch latest source discussions ---
+            const sourceQuery = await github.graphql(`
+              query($owner: String!, $name: String!) {
+                repository(owner: $owner, name: $name) {
+                  discussions(first: 20, orderBy: {field: CREATED_AT, direction: DESC}) {
+                    nodes {
+                      id
+                      number
+                      title
+                      body
+                      category { name }
+                      labels(first: 20) {
+                        nodes { name }
+                      }
+                    }
+                  }
+                }
+              }
+            `, { owner: SOURCE_OWNER, name: SOURCE_REPO });
+            const sourceDiscussions = sourceQuery.repository.discussions.nodes;
+
+            // --- Filter to un-mirrored, take at most MAX ---
+            const toMirror = sourceDiscussions
+              .filter(d => !existingTitles.has(d.title))
+              .slice(0, MAX_DISCUSSIONS);
+
+            if (toMirror.length === 0) {
+              core.info('No new discussions to mirror.');
+              return;
+            }
+
+            // --- Content cleaning helpers ---
+            function cleanBody(body) {
+              // Remove URLs linking to source repo discussions/issues
+              const urlRe = new RegExp(`https?://github\\.com/${escSlug}/(discussions|issues)/\\d+\\S*`, 'g');
+              let cleaned = body.replace(urlRe, '');
+              // Remove source/repo#NNN references
+              const refRe = new RegExp(`${escSlug}#\\d+`, 'g');
+              cleaned = cleaned.replace(refRe, '');
+              // Remove bare #NNN references (only whole-word)
+              cleaned = cleaned.replace(/(?<!\w)#\d+(?!\w)/g, '');
+              // Remove sentences containing mirror/import phrases
+              cleaned = cleaned.replace(/[^\n.]*\b(original discussion|cross-post|imported from|mirrored from)\b[^\n.]*/gi, '');
+              // Escape org/repo#123 autolinks by wrapping in backticks
+              cleaned = cleaned.replace(/(?<!`)(\w+\/\w+#\d+)(?!`)/g, '`$1`');
+              // Collapse multiple blank lines
+              cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
+              return cleaned.trim();
+            }
+
+            // --- Get default category (first available) ---
+            const defaultCatId = destCategories.length > 0 ? destCategories[0].id : null;
+
+            // --- Create mirrored discussions ---
+            const repositoryId = (await github.graphql(`
+              query($owner: String!, $name: String!) {
+                repository(owner: $owner, name: $name) { id }
+              }
+            `, { owner: context.repo.owner, name: context.repo.repo })).repository.id;
+
+            const newEntries = [];
+
+            for (const disc of toMirror) {
+              const title = disc.title;
+              const body = cleanBody(disc.body);
+
+              // Category: exact match or default
+              const catName = disc.category?.name;
+              const categoryId = (catName && destCatByName[catName]) || defaultCatId;
+
+              if (!categoryId) {
+                core.warning(`Skipping "${title}": no discussion category available.`);
+                continue;
+              }
+
+              // Create discussion via GraphQL
+              const createResult = await github.graphql(`
+                mutation($repositoryId: ID!, $categoryId: ID!, $title: String!, $body: String!) {
+                  createDiscussion(input: {
+                    repositoryId: $repositoryId,
+                    categoryId: $categoryId,
+                    title: $title,
+                    body: $body
+                  }) {
+                    discussion { id number }
+                  }
+                }
+              `, { repositoryId, categoryId, title, body });
+
+              const newDisc = createResult.createDiscussion.discussion;
+              core.info(`Created discussion #${newDisc.number}: ${title}`);
+
+              // Apply matching labels
+              const matchingLabels = (disc.labels?.nodes || [])
+                .map(l => l.name)
+                .filter(n => destLabelNames.has(n));
+
+              if (matchingLabels.length > 0) {
+                // Get label node IDs
+                const labelIds = [];
+                for (const labelName of matchingLabels) {
+                  const labelResp = await github.rest.issues.getLabel({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    name: labelName
+                  });
+                  labelIds.push(labelResp.data.node_id);
+                }
+
+                await github.graphql(`
+                  mutation($labelableId: ID!, $labelIds: [ID!]!) {
+                    addLabelsToLabelable(input: {
+                      labelableId: $labelableId,
+                      labelIds: $labelIds
+                    }) {
+                      clientMutationId
+                    }
+                  }
+                `, { labelableId: newDisc.id, labelIds });
+
+                core.info(`  Applied labels: ${matchingLabels.join(', ')}`);
+              }
+            }
+
+
