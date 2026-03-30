@@ -1,4 +1,4 @@
-name: Dispatch Staff Label Feedback
+name: Dispatch Label Feedback
 
 on:
   discussion:
@@ -18,7 +18,7 @@ jobs:
       - name: Forward discussion label events
         uses: actions/github-script@v8
         with:
-          github-token: ${{ secrets.COMMUNITY_OPS_DISPATCH_TOKEN }}
+          github-token: ${{ secrets.COMM_OPS_TOKEN }}
           script: |
             const actor = context.actor;
             const action = context.payload.action;
@@ -43,7 +43,7 @@ jobs:
             await github.rest.repos.createDispatchEvent({
               owner,
               repo,
-              event_type: "staff-label-correction",
+              event_type: "label-feedback",
               client_payload: {
                 data: {
                   source_repository: `${context.repo.owner}/${context.repo.repo}`,
