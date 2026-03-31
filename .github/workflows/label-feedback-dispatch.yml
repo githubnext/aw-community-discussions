@@ -18,7 +18,7 @@ jobs:
       - name: Forward discussion label events
         uses: actions/github-script@v8
         with:
-          github-token: ${{ secrets.COMM_OPS_TOKEN }}
+          github-token: ${{ secrets.COMM_COMM_OPS_DISPATCH_TOKEN }}
           script: |
             const actor = context.actor;
             const action = context.payload.action;
