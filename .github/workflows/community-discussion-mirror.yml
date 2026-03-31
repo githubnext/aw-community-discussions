@@ -60,13 +60,22 @@ jobs:
             const destCategories = destCatsQuery.repository.discussionCategories.nodes;
             const destCatByName = Object.fromEntries(destCategories.map(c => [c.name, c.id]));
 
-            // --- Fetch destination labels ---
-            const destLabelsResp = await github.rest.issues.listLabelsForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              per_page: 100
-            });
-            const destLabelNames = new Set(destLabelsResp.data.map(l => l.name));
+            // --- Fetch destination labels (ALL pages) ---
+            const destLabelNames = new Set();
+            let page = 1;
+            while (true) {
+              const destLabelsResp = await github.rest.issues.listLabelsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100,
+                page
+              });
+
+              for (const l of destLabelsResp.data) destLabelNames.add(l.name);
+
+              if (destLabelsResp.data.length < 100) break; // last page
+              page += 1;
+            }
 
             // --- Fetch latest source discussions ---
             const sourceQuery = await github.graphql(`
@@ -127,8 +136,6 @@ jobs:
                 repository(owner: $owner, name: $name) { id }
               }
             `, { owner: context.repo.owner, name: context.repo.repo })).repository.id;
-
-            const newEntries = [];
 
             for (const disc of toMirror) {
               const title = disc.title;
@@ -191,5 +198,3 @@ jobs:
                 core.info(`  Applied labels: ${matchingLabels.join(', ')}`);
               }
             }
-
-
