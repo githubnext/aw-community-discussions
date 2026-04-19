@@ -15,6 +15,10 @@ permissions:
   contents: read
   discussions: write
 
+concurrency:
+  group: community-discussion-mirror-${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   mirror:
     runs-on: ubuntu-latest
@@ -32,20 +36,72 @@ jobs:
             const SOURCE_REPO = process.env.SOURCE_REPO;
             const SOURCE_SLUG = `${SOURCE_OWNER}/${SOURCE_REPO}`;
             const MAX_DISCUSSIONS = parseInt(process.env.MAX_DISCUSSIONS, 10);
+            const MIRROR_METADATA_MARKER = 'community-discussion-mirror';
 
             const escSlug = SOURCE_SLUG.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-            // --- Fetch existing discussion titles in this repo for dedup ---
-            const existingQuery = await github.graphql(`
-              query($owner: String!, $name: String!) {
-                repository(owner: $owner, name: $name) {
-                  discussions(first: 100, orderBy: {field: CREATED_AT, direction: DESC}) {
-                    nodes { title }
-                  }
-                }
+            function buildSourceKey(sourceRepository, discussionNumber) {
+              return `${sourceRepository}#${discussionNumber}`;
+            }
+
+            function extractHiddenJson(body, marker) {
+              const match = String(body || '').match(new RegExp(`<!-- ${marker}\\n([\\s\\S]*?)\\n-->`));
+              if (!match) {
+                return null;
               }
-            `, { owner: context.repo.owner, name: context.repo.repo });
-            const existingTitles = new Set(existingQuery.repository.discussions.nodes.map(d => d.title));
+
+              try {
+                return JSON.parse(match[1]);
+              } catch {
+                return null;
+              }
+            }
+
+            async function fetchExistingDiscussions() {
+              const discussions = [];
+              let cursor = null;
+
+              while (true) {
+                const existingQuery = await github.graphql(`
+                  query($owner: String!, $name: String!, $cursor: String) {
+                    repository(owner: $owner, name: $name) {
+                      discussions(first: 100, after: $cursor, orderBy: {field: CREATED_AT, direction: DESC}) {
+                        pageInfo {
+                          hasNextPage
+                          endCursor
+                        }
+                        nodes {
+                          number
+                          title
+                          body
+                        }
+                      }
+                    }
+                  }
+                `, { owner: context.repo.owner, name: context.repo.repo, cursor });
+
+                const page = existingQuery.repository.discussions;
+                discussions.push(...page.nodes);
+
+                if (!page.pageInfo.hasNextPage) {
+                  break;
+                }
+
+                cursor = page.pageInfo.endCursor;
+              }
+
+              return discussions;
+            }
+
+            // --- Fetch existing mirrored discussions in this repo for dedup ---
+            const existingDiscussions = await fetchExistingDiscussions();
+            const existingTitles = new Set(existingDiscussions.map(d => d.title));
+            const existingSourceKeys = new Set(
+              existingDiscussions
+                .map((discussion) => extractHiddenJson(discussion.body, MIRROR_METADATA_MARKER))
+                .filter((metadata) => metadata?.source_repository && metadata?.source_discussion_number)
+                .map((metadata) => buildSourceKey(metadata.source_repository, metadata.source_discussion_number))
+            );
 
             // --- Fetch destination categories ---
             const destCatsQuery = await github.graphql(`
@@ -59,24 +115,6 @@ jobs:
             `, { owner: context.repo.owner, name: context.repo.repo });
             const destCategories = destCatsQuery.repository.discussionCategories.nodes;
             const destCatByName = Object.fromEntries(destCategories.map(c => [c.name, c.id]));
-
-            // --- Fetch destination labels (ALL pages) ---
-            const destLabelNames = new Set();
-            let page = 1;
-            while (true) {
-              const destLabelsResp = await github.rest.issues.listLabelsForRepo({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                per_page: 100,
-                page
-              });
-
-              for (const l of destLabelsResp.data) destLabelNames.add(l.name);
-
-              if (destLabelsResp.data.length < 100) break; // last page
-              page += 1;
-            }
-
             // --- Fetch latest source discussions ---
             const sourceQuery = await github.graphql(`
               query($owner: String!, $name: String!) {
@@ -100,7 +138,15 @@ jobs:
 
             // --- Filter to un-mirrored, take at most MAX ---
             const toMirror = sourceDiscussions
-              .filter(d => !existingTitles.has(d.title))
+              .filter((discussion) => {
+                const sourceKey = buildSourceKey(SOURCE_SLUG, discussion.number);
+                if (existingSourceKeys.has(sourceKey)) {
+                  return false;
+                }
+
+                // Legacy fallback for mirrors created before source metadata was embedded.
+                return !existingTitles.has(discussion.title);
+              })
               .slice(0, MAX_DISCUSSIONS);
 
             if (toMirror.length === 0) {
@@ -110,21 +156,46 @@ jobs:
 
             // --- Content cleaning helpers ---
             function cleanBody(body) {
+              let cleaned = String(body || '');
               // Remove URLs linking to source repo discussions/issues
               const urlRe = new RegExp(`https?://github\\.com/${escSlug}/(discussions|issues)/\\d+\\S*`, 'g');
-              let cleaned = body.replace(urlRe, '');
+              cleaned = cleaned.replace(urlRe, '');
+              // Remove markdown links to the source repo entirely
+              const markdownSourceLinkRe = new RegExp(`\\[[^\\]]*\\]\\(https?://github\\.com/${escSlug}[^)]*\\)`, 'gi');
+              cleaned = cleaned.replace(markdownSourceLinkRe, '');
               // Remove source/repo#NNN references
-              const refRe = new RegExp(`${escSlug}#\\d+`, 'g');
+              const refRe = new RegExp(`${escSlug}#\\d+`, 'gi');
               cleaned = cleaned.replace(refRe, '');
+              // Remove plain source repo mentions so GitHub cannot autolink them
+              const slugRe = new RegExp(`(?<![\\w`])${escSlug}(?![\\w`])`, 'gi');
+              cleaned = cleaned.replace(slugRe, '');
               // Remove bare #NNN references (only whole-word)
               cleaned = cleaned.replace(/(?<!\w)#\d+(?!\w)/g, '');
               // Remove sentences containing mirror/import phrases
               cleaned = cleaned.replace(/[^\n.]*\b(original discussion|cross-post|imported from|mirrored from)\b[^\n.]*/gi, '');
               // Escape org/repo#123 autolinks by wrapping in backticks
               cleaned = cleaned.replace(/(?<!`)(\w+\/\w+#\d+)(?!`)/g, '`$1`');
+              // Remove any lines that only contain punctuation or markdown artifacts after stripping source refs
+              cleaned = cleaned
+                .split('\n')
+                .filter((line) => !/^[\s()\[\]<>:.-]*$/.test(line))
+                .join('\n');
               // Collapse multiple blank lines
               cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
               return cleaned.trim();
+            }
+
+            function buildMirrorMetadata(discussion) {
+              return [
+                `<!-- ${MIRROR_METADATA_MARKER}`,
+                JSON.stringify({
+                  source_repository: SOURCE_SLUG,
+                  source_discussion_number: discussion.number,
+                  mirrored_at: new Date().toISOString(),
+                  prediction_status: 'unlabelled-shadow'
+                }, null, 2),
+                '-->'
+              ].join('\n');
             }
 
             // --- Get default category (first available) ---
@@ -139,7 +210,8 @@ jobs:
 
             for (const disc of toMirror) {
               const title = disc.title;
-              const body = cleanBody(disc.body);
+              const cleanedBody = cleanBody(disc.body);
+              const body = [cleanedBody, '', buildMirrorMetadata(disc)].filter(Boolean).join('\n\n');
 
               // Category: exact match or default
               const catName = disc.category?.name;
@@ -166,35 +238,4 @@ jobs:
 
               const newDisc = createResult.createDiscussion.discussion;
               core.info(`Created discussion #${newDisc.number}: ${title}`);
-
-              // Apply matching labels
-              const matchingLabels = (disc.labels?.nodes || [])
-                .map(l => l.name)
-                .filter(n => destLabelNames.has(n));
-
-              if (matchingLabels.length > 0) {
-                // Get label node IDs
-                const labelIds = [];
-                for (const labelName of matchingLabels) {
-                  const labelResp = await github.rest.issues.getLabel({
-                    owner: context.repo.owner,
-                    repo: context.repo.repo,
-                    name: labelName
-                  });
-                  labelIds.push(labelResp.data.node_id);
-                }
-
-                await github.graphql(`
-                  mutation($labelableId: ID!, $labelIds: [ID!]!) {
-                    addLabelsToLabelable(input: {
-                      labelableId: $labelableId,
-                      labelIds: $labelIds
-                    }) {
-                      clientMutationId
-                    }
-                  }
-                `, { labelableId: newDisc.id, labelIds });
-
-                core.info(`  Applied labels: ${matchingLabels.join(', ')}`);
-              }
             }

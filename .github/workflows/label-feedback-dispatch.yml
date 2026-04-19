@@ -3,6 +3,7 @@ name: Dispatch Label Feedback
 on:
   discussion:
     types:
+      - created
       - labeled
       - unlabeled
 
@@ -14,8 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       COMMUNITY_OPS_REPOSITORY: githubnext/aw-community-ops
+      PROD_TRUSTED_STAFF: samus-aran,queenofcorgis,akash1134,ghostinhershell,shinybrightstar,ebndev,mecodeatlas,mnkiefer
     steps:
-      - name: Forward discussion label events
+      - name: Forward discussion events
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.COMM_COMM_OPS_DISPATCH_TOKEN }}
@@ -24,41 +26,55 @@ jobs:
             const action = context.payload.action;
             const discussion = context.payload.discussion;
             const label = context.payload.label;
-
-            if (!label?.name) {
-              core.info("Skipping event with missing label");
-              return;
-            }
+            const trustedStaff = new Set(
+              String(process.env.PROD_TRUSTED_STAFF || '')
+                .split(',')
+                .map((value) => value.trim())
+                .filter(Boolean)
+            );
 
             if (!discussion?.number) {
               throw new Error("Missing discussion number in discussion event payload");
             }
 
-            if ((actor || "").endsWith("[bot]")) {
+            const actorType = (actor || "").endsWith("[bot]") ? "bot" : "human";
+            if (actorType === "bot") {
               core.info(`Skipping bot-generated event: ${actor}`);
               return;
             }
+
+            const dispatchEventType = action === "created" ? "discussion-created" : "label-feedback";
+            if (dispatchEventType === "label-feedback" && !label?.name) {
+              core.info("Skipping label event with missing label");
+              return;
+            }
+
+            const isTrustedStaff = trustedStaff.has(actor || '');
+            const labelSource = dispatchEventType === 'label-feedback' ? 'manual' : 'mirror-observation';
 
             const [owner, repo] = process.env.COMMUNITY_OPS_REPOSITORY.split("/");
             await github.rest.repos.createDispatchEvent({
               owner,
               repo,
-              event_type: "label-feedback",
+              event_type: dispatchEventType,
               client_payload: {
                 data: {
                   source_repository: `${context.repo.owner}/${context.repo.repo}`,
-                  target_repository: `${process.env.COMMUNITY_OPS_REPOSITORY}`,
+                  origin_repo_role: 'prod-truth',
                   discussion_number: discussion.number,
                   discussion_title: discussion.title || "unknown",
                   discussion_url: discussion.html_url || discussion.url || "",
                   category: discussion.category?.name || "unknown",
                   category_slug: discussion.category?.slug || "unknown",
                   event_type: action,
-                  label: label.name,
+                  label: label?.name || null,
                   actor,
+                  actor_type: actorType,
+                  is_trusted_staff: isTrustedStaff,
+                  label_source: labelSource,
                   createdAt: new Date().toISOString(),
                 },
               },
             });
 
-            core.info(`Forwarded ${action} event for discussion #${discussion.number}`);
+            core.info(`Forwarded ${action} event as ${dispatchEventType} for discussion #${discussion.number}`);
